@@ -307,7 +307,7 @@ void Model::afterTrain(int step){
         int resetInterval = resetAlphaEvery * refineEvery;
         bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
         torch::Tensor splitsMask;
-        const float cullAlphaThresh = 0.1f;
+        const float cullAlphaThresh = 0.05f;
 
         if (doDensification){
             int numPointsBefore = means.size(0);

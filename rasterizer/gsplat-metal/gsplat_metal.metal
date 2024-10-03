@@ -47,6 +47,21 @@ inline uint num_sh_bases(const uint degree) {
     return 25;
 }
 
+inline float safe_rsqrt(float x, float epsilon = 1e-6f) {
+    // Prevent division by zero or negative numbers
+    if (x <= epsilon || isnan(x) || isinf(x)) {
+        return 0.0f;
+    }
+    return rsqrt(x);
+}
+
+inline bool is_finite_matrix3x3(const float3x3 matrix) {
+    return isfinite(matrix[0][0]) && isfinite(matrix[0][1]) && isfinite(matrix[0][2]) &&
+           isfinite(matrix[1][0]) && isfinite(matrix[1][1]) && isfinite(matrix[1][2]) &&
+           isfinite(matrix[2][0]) && isfinite(matrix[2][1]) && isfinite(matrix[2][2]);
+}
+
+
 inline float ndc2pix(const float x, const float W, const float cx) {
     return 0.5f * W * x + cx - 0.5;
 }
@@ -109,16 +124,15 @@ inline float4 transform_4x4(constant float *mat, const float3 p) {
 
 inline float3x3 quat_to_rotmat(const float4 quat) {
     // quat to rotation matrix
-    float s = rsqrt(
-        quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z
-    );
+    float norm_sq = quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z;
+    float s = (norm_sq > 0.0f) ? rsqrt(norm_sq) : 1.0f; // [NaN/Inf Handling]
     float w = quat.x * s;
     float x = quat.y * s;
     float y = quat.z * s;
     float z = quat.w * s;
 
     // metal matrices are column-major
-    return float3x3(
+    float3x3 rot = float3x3(
         1.f - 2.f * (y * y + z * z),
         2.f * (x * y + w * z),
         2.f * (x * z - w * y),
@@ -129,6 +143,16 @@ inline float3x3 quat_to_rotmat(const float4 quat) {
         2.f * (y * z - w * x),
         1.f - 2.f * (x * x + y * y)
     );
+
+    // [NaN/Inf Handling] Check all elements
+    if (!is_finite_matrix3x3(rot)) {
+        // Fallback to identity matrix if invalid
+        return float3x3(1.0f, 0.0f, 0.0f,
+                       0.0f, 1.0f, 0.0f,
+                       0.0f, 0.0f, 1.0f);
+    }
+
+    return rot;
 }
 
 // device helper for culling near points
@@ -157,17 +181,37 @@ inline float3x3 scale_to_mat(const float3 scale, const float glob_scale) {
 inline void scale_rot_to_cov3d(
     const float3 scale, const float glob_scale, const float4 quat, device float *cov3d
 ) {
-    // printf("quat %.2f %.2f %.2f %.2f\n", quat.x, quat.y, quat.z, quat.w);
     float3x3 R = quat_to_rotmat(quat);
-    // printf("R %.2f %.2f %.2f\n", R[0][0], R[1][1], R[2][2]);
     float3x3 S = scale_to_mat(scale, glob_scale);
-    // printf("S %.2f %.2f %.2f\n", S[0][0], S[1][1], S[2][2]);
-
     float3x3 M = R * S;
-    float3x3 tmp = M * transpose(M);
-    // printf("tmp %.2f %.2f %.2f\n", tmp[0][0], tmp[1][1], tmp[2][2]);
 
-    // save upper right because symmetric
+    // [NaN/Inf Handling] Check all elements of M
+    if (!is_finite_matrix3x3(M)) {
+        // Fallback to identity covariance or another safe default
+        cov3d[0] = 1.0f;
+        cov3d[1] = 0.0f;
+        cov3d[2] = 0.0f;
+        cov3d[3] = 1.0f;
+        cov3d[4] = 0.0f;
+        cov3d[5] = 1.0f;
+        return;
+    }
+
+    float3x3 tmp = M * transpose(M);
+
+    // [NaN/Inf Handling] Check all elements of tmp
+    if (!is_finite_matrix3x3(tmp)) {
+        // Fallback to identity covariance or another safe default
+        cov3d[0] = 1.0f;
+        cov3d[1] = 0.0f;
+        cov3d[2] = 0.0f;
+        cov3d[3] = 1.0f;
+        cov3d[4] = 0.0f;
+        cov3d[5] = 1.0f;
+        return;
+    }
+
+    // Save upper right because symmetric
     cov3d[0] = tmp[0][0];
     cov3d[1] = tmp[0][1];
     cov3d[2] = tmp[0][2];
@@ -201,7 +245,20 @@ float3 project_cov3d_ewa(
         viewmat[10]
     );
     float3 p = float3(viewmat[3], viewmat[7], viewmat[11]);
+
+    // Check for NaN/Inf in W and p
+    bool invalid_W = !is_finite_matrix3x3(W);
+    bool invalid_p = !isfinite(p.x) || !isfinite(p.y) || !isfinite(p.z);
+    if (invalid_W || invalid_p) {
+        // Return default covariance
+        return float3(1.0f, 0.0f, 1.0f);
+    }
+
     float3 t = W * float3(mean3d.x, mean3d.y, mean3d.z) + p;
+    // [NaN/Inf Handling] Check t.z to prevent division by zero
+    if (!isfinite(t.z) || fabs(t.z) < 1e-6f) {
+        return float3(1.0f, 0.0f, 1.0f);
+    }
 
     // clip so that the covariance
     float lim_x = 1.3 * tan_fovx;
@@ -225,6 +282,10 @@ float3 project_cov3d_ewa(
         -fy * t.y * rz2,
         0.f
     );
+    if (!is_finite_matrix3x3(J)) {
+        return float3(1.0f, 0.0f, 1.0f);
+    }
+
     float3x3 T = J * W;
 
     float3x3 V = float3x3(
@@ -238,8 +299,16 @@ float3 project_cov3d_ewa(
         cov3d[4],
         cov3d[5]
     );
+    if (!is_finite_matrix3x3(V)) {
+        return float3(1.0f, 0.0f, 1.0f);
+    }
 
     float3x3 cov = T * V * transpose(T);
+
+    // Final return with NaN/Inf check
+    if (!is_finite_matrix3x3(cov)) {
+        return float3(1.0f, 0.0f, 1.0f); // Default safe values
+    }
 
     // add a little blur along axes and save upper triangular elements
     return float3(float(cov[0][0]) + 0.3f, float(cov[0][1]), float(cov[1][1]) + 0.3f);
@@ -250,26 +319,36 @@ inline bool compute_cov2d_bounds(
     thread float3 &conic, 
     thread float &radius
 ) {
-    // find eigenvalues of 2d covariance matrix
-    // expects upper triangular values of cov matrix as float3
-    // then compute the radius and conic dimensions
-    // the conic is the inverse cov2d matrix, represented here with upper
-    // triangular values.
+    // Check for NaN/Inf in cov2d
+    if (!isfinite(cov2d.x) || !isfinite(cov2d.y) || !isfinite(cov2d.z)) {
+        // Set default conic and radius
+        conic = float3(1.0f, 0.0f, 1.0f);
+        radius = 1;
+        return false;
+    }
+
+    // Find eigenvalues of 2d covariance matrix
     float det = cov2d.x * cov2d.z - cov2d.y * cov2d.y;
-    if (det == 0.f)
+    if (det <= 0.f || !isfinite(det)) // Modified condition
         return false;
     float inv_det = 1.f / det;
 
-    // inverse of 2x2 cov2d matrix
-    conic.x = cov2d.z * inv_det;
-    conic.y = -cov2d.y * inv_det;
-    conic.z = cov2d.x * inv_det;
+    // Inverse of 2x2 cov2d matrix
+    conic.x = (isfinite(cov2d.z * inv_det)) ? cov2d.z * inv_det : 1.0f;
+    conic.y = (isfinite(-cov2d.y * inv_det)) ? -cov2d.y * inv_det : 0.0f;
+    conic.z = (isfinite(cov2d.x * inv_det)) ? cov2d.x * inv_det : 1.0f;
 
     float b = 0.5f * (cov2d.x + cov2d.z);
-    float v1 = b + sqrt(max(0.1f, b * b - det));
-    float v2 = b - sqrt(max(0.1f, b * b - det));
-    // take 3 sigma of covariance
+    float discriminant = b * b - det;
+    if (!isfinite(discriminant) || discriminant < 0.0f) {
+        radius = 1;
+        return false;
+    }
+    float v1 = b + sqrt(max(0.0f, discriminant));
+    float v2 = b - sqrt(max(0.0f, discriminant));
+    // Take 3 sigma of covariance
     radius = ceil(3.f * sqrt(max(v1, v2)));
+    radius = isfinite(radius) ? radius : 1; // [NaN/Inf Handling]
     return true;
 }
 
@@ -278,11 +357,11 @@ inline float2 project_pix(
 ) {
     // ROW MAJOR mat
     float4 p_hom = transform_4x4(mat, p);
-    float rw = 1.f / (p_hom.w + 1e-6f);
+    float rw = (isfinite(p_hom.w) && fabs(p_hom.w) > 1e-6f) ? (1.f / p_hom.w) : 0.0f; // [NaN/Inf Handling]
     float3 p_proj = {p_hom.x * rw, p_hom.y * rw, p_hom.z * rw};
-    return {
-        ndc2pix(p_proj.x, (int)img_size.x, pp.x), ndc2pix(p_proj.y, (int)img_size.y, pp.y)
-    };
+    float x_pix = ndc2pix(p_proj.x, (int)img_size.x, pp.x);
+    float y_pix = ndc2pix(p_proj.y, (int)img_size.y, pp.y);
+    return {isfinite(x_pix) ? x_pix : 0.0f, isfinite(y_pix) ? y_pix : 0.0f}; // [NaN/Inf Handling]
 }
 
 /* 
@@ -392,19 +471,19 @@ kernel void project_gaussians_forward_kernel(
         return;
     }
 
-    // compute the projected covariance
+    // Compute the projected covariance
     float3 scale = read_packed_float3(scales, idx);
     float4 quat = read_packed_float4(quats, idx);
     device float *cur_cov3d = &(covs3d[6 * idx]);
     scale_rot_to_cov3d(scale, glob_scale, quat, cur_cov3d);
 
-    // project to 2d with ewa approximation
+    // Project to 2d with ewa approximation
     float fx = intrins.x;
     float fy = intrins.y;
     float cx = intrins.z;
     float cy = intrins.w;
-    float tan_fovx = 0.5 * img_size.x / fx;
-    float tan_fovy = 0.5 * img_size.y / fy;
+    float tan_fovx = 0.5f * img_size.x / fx;
+    float tan_fovy = 0.5f * img_size.y / fy;
     float3 cov2d = project_cov3d_ewa(
         p_world, cur_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy
     );
@@ -413,23 +492,26 @@ kernel void project_gaussians_forward_kernel(
     float radius;
     bool ok = compute_cov2d_bounds(cov2d, conic, radius);
     if (!ok) {
-        return; // zero determinant
+        return; // zero determinant or invalid covariance
     }
     write_packed_float3(conics, idx, conic);
 
-    // compute the projected mean
+    // Compute the projected mean
     float2 center = project_pix(projmat, p_world, img_size, {cx, cy});
     uint2 tile_min, tile_max;
     get_tile_bbox(center, radius, (int3)tile_bounds, tile_min, tile_max);
     int32_t tile_area = (tile_max.x - tile_min.x) * (tile_max.y - tile_min.y);
-    if (tile_area <= 0) {
+    if (tile_area <= 0 || tile_area >= 2147000000) { // [NaN/Inf Handling]
         return;
     }
 
     num_tiles_hit[idx] = tile_area;
-    depths[idx] = p_view.z;
-    radii[idx] = (int)radius;
-    write_packed_float2(xys, idx, center);
+    depths[idx] = isfinite(p_view.z) ? p_view.z : clip_thresh; // [NaN/Inf Handling]
+    radii[idx] = (int)(isfinite(radius) ? radius : 1); // [NaN/Inf Handling]
+    write_packed_float2(xys, idx, {
+        isfinite(center.x) ? center.x : 0.0f,
+        isfinite(center.y) ? center.y : 0.0f
+    });
 }
 
 kernel void nd_rasterize_forward_kernel(
@@ -450,7 +532,7 @@ kernel void nd_rasterize_forward_kernel(
     uint2 blockIdx [[threadgroup_position_in_grid]],
     uint2 threadIdx [[thread_position_in_threadgroup]]
 ) {
-    // current naive implementation where tile data loading is redundant
+    // Current naive implementation where tile data loading is redundant
     // TODO tile data should be shared between tile threads
     int32_t tile_id = blockIdx.y * tile_bounds.x + blockIdx.x;
     int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
@@ -459,17 +541,16 @@ kernel void nd_rasterize_forward_kernel(
     float py = (float)i;
     int32_t pix_id = i * (int)img_size.x + j;
 
-    // return if out of bounds
+    // Return if out of bounds
     if (i >= (int)img_size.y || j >= (int)img_size.x) {
         return;
     }
 
-    // which gaussians to look through in this tile
+    // Which gaussians to look through in this tile
     int2 range = read_packed_int2(tile_bins, tile_id);
     float T = 1.f;
 
-    // iterate over all gaussians and apply rendering EWA equation (e.q. 2 from
-    // paper)
+    // Iterate over all gaussians and apply rendering EWA equation (e.q. 2 from paper)
     int idx;
     for (idx = range.x; idx < range.y; ++idx) {
         const int32_t g = gaussian_ids_sorted[idx];
@@ -478,42 +559,63 @@ kernel void nd_rasterize_forward_kernel(
         const float2 delta = {center.x - px, center.y - py};
 
         // Mahalanobis distance (here referred to as sigma) measures how many
-        // standard deviations away distance delta is. sigma = -0.5(d.T * conic
-        // * d)
-        const float sigma =
+        // standard deviations away distance delta is. sigma = -0.5(d.T * conic * d)
+        float sigma =
             0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) +
             conic.y * delta.x * delta.y;
-        if (sigma < 0.f) {
+        if (!isfinite(sigma) || sigma < 0.f) { // [NaN/Inf Handling]
             continue;
         }
         const float opac = opacities[g];
+        if (!isfinite(opac)) { // [NaN/Inf Handling]
+            continue;
+        }
 
-        const float alpha = min(0.999f, opac * exp(-sigma));
+        float alpha = min(0.999f, opac * exp(-sigma));
+        if (!isfinite(alpha)) { // [NaN/Inf Handling]
+            alpha = 0.0f;
+        }
 
-        // break out conditions
+        // Break out conditions
         if (alpha < 1.f / 255.f) {
             continue;
         }
-        const float next_T = T * (1.f - alpha);
+        float next_T = T * (1.f - alpha);
+        if (!isfinite(next_T)) { // [NaN/Inf Handling]
+            next_T = 0.0f;
+        }
         if (next_T <= 1e-4f) {
-            // we want to render the last gaussian that contributes and note
+            // We want to render the last gaussian that contributes and note
             // that here idx > range.x so we don't underflow
             idx -= 1;
             break;
         }
-        const float vis = alpha * T;
+        float vis = alpha * T;
+        if (!isfinite(vis)) { // [NaN/Inf Handling]
+            vis = 0.0f;
+        }
         for (int c = 0; c < channels; ++c) {
+            if (!isfinite(colors[channels * g + c])) { // [NaN/Inf Handling]
+                continue;
+            }
+            if (!isfinite(vis)) { // [NaN/Inf Handling]
+                continue;
+            }
             out_img[channels * pix_id + c] += colors[channels * g + c] * vis;
         }
         T = next_T;
     }
-    final_Ts[pix_id] = T; // transmittance at last gaussian in this pixel
+    final_Ts[pix_id] = isfinite(T) ? T : 0.0f; // Transmittance at last gaussian in this pixel
     final_index[pix_id] =
         (idx == range.y)
-            ? idx - 1
-            : idx; // index of in bin of last gaussian in this pixel
+            ? (idx - 1)
+            : idx; // Index of in bin of last gaussian in this pixel
     for (int c = 0; c < channels; ++c) {
-        out_img[channels * pix_id + c] += T * background[c];
+        float bg = background[c];
+        if (!isfinite(bg)) { // [NaN/Inf Handling]
+            bg = 0.0f;
+        }
+        out_img[channels * pix_id + c] += (isfinite(T) ? T : 0.0f) * bg;
     }
 }
 
@@ -1420,14 +1522,31 @@ kernel void compute_cov2d_bounds_kernel(
         return;
     }
     int index = row * 3;
-    float3 conic;
-    float radius;
     float3 cov2d{
         (float)covs2d[index], (float)covs2d[index + 1], (float)covs2d[index + 2]
     };
-    compute_cov2d_bounds(cov2d, conic, radius);
+
+    // Check for NaN/Inf in cov2d
+    if (!isfinite(cov2d.x) || !isfinite(cov2d.y) || !isfinite(cov2d.z)) {
+        conics[index] = 1.0f;
+        conics[index + 1] = 0.0f;
+        conics[index + 2] = 1.0f;
+        radii[row] = 1;
+        return;
+    }
+
+    float3 conic;
+    float radius;
+    bool ok = compute_cov2d_bounds(cov2d, conic, radius);
+    if (!ok) {
+        conics[index] = 1.0f;
+        conics[index + 1] = 0.0f;
+        conics[index + 2] = 1.0f;
+        radii[row] = 1;
+        return;
+    }
     conics[index] = conic.x;
     conics[index + 1] = conic.y;
     conics[index + 2] = conic.z;
-    radii[row] = radius;
+    radii[row] = isfinite(radius) ? radius : 1; // [NaN/Inf Handling]
 }
