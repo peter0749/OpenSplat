@@ -571,10 +571,12 @@ kernel void nd_rasterize_forward_kernel(
             continue;
         }
 
-        float alpha = min(0.999f, opac * exp(-sigma));
-        if (!isfinite(alpha)) { // [NaN/Inf Handling]
+        float alpha = opac * exp(-sigma);
+        if (!isfinite(alpha) || alpha > 2.0f) { // [NaN/Inf Handling]
             alpha = 0.0f;
         }
+
+        alpha = min(0.999f, alpha);
 
         // Break out conditions
         if (alpha < 1.f / 255.f) {
@@ -1046,7 +1048,10 @@ kernel void rasterize_backward_kernel(
                                             conic.z * delta.y * delta.y) +
                                     conic.y * delta.x * delta.y;
                 vis = exp(-sigma);
-                alpha = min(0.99f, opac * vis);
+                alpha = opac * vis;
+                if (!isfinite(alpha) || alpha < 0 || alpha > 2.0)
+                    alpha = 0.f;
+                alpha = min(0.99f, alpha);
                 if (sigma < 0.f || alpha < 1.f / 255.f) {
                     valid = 0;
                 }
@@ -1190,7 +1195,10 @@ kernel void nd_rasterize_backward_kernel(
         }
         const float opac = opacities[g];
         const float vis = exp(-sigma);
-        const float alpha = min(0.99f, opac * vis);
+        float alpha = opac * vis;
+        if (!isfinite(alpha) || alpha < 0 || alpha > 2.0)
+            alpha = 0.f;
+        alpha = min(0.99f, alpha);
         if (alpha < 1.f / 255.f) {
             continue;
         }
